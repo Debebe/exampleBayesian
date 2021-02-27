@@ -1,0 +1,311 @@
+---
+title: "Factors associated with angiographic heart diseases: Bayesian analaysis"
+author: "Debebe Shaweno"
+date: "17/01/2021"
+output:
+  html_document:
+    theme: cosmo
+    toc: yes
+    number_sections: no
+    highlight: tango
+  pdf_document:
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# Introduction
+
+There is no single cause for heart diseases. Often, heart problems are caused by network of complex factors that are related to the host, environment and even genetic factors. As a result, it is very difficult to measure all possible causes of heart diseases. As such, the dataset, provided has 14 variables and I do believe these are not comprehensive lists of predictors of these complex health problem. Moreover, there always exists variabilities (which we often can not measure) between individuals. For example, some individuals might naturally have high or low blood pressure, blood cholesterol level and etc that does not necessarily indicate risk of heart diseases. So statistical models, need to take into account these potential variations between individual and effects also from unmeasured covariates. To this end, I do believe Bayesian models can handle these unmeasured effects and even individual varions through random effect terms.  Cognizant of this fact, my analysis will employ bayesian modelling here
+
+
+# Aims
+
+This work uses Cleveland heart data to identify factors associated with heart problems. The dataset does not clearly mention how the data were generated which would be an essential piece of information to decide suitable data analysis approaches. This analysis assumes that the data were generated using crossectional surveys.  
+
+
+Brief description variables in the dataset
+
+Variable name | Short desciption  | Variable name | Short description
+------------- | ------------- |-------------|------------------------
+age    | Age in years   |thalach | maximum heart rate achieved
+sex    | Sex(1=M, 0=F)  | exang | exercise induced angina (1 = yes; 0 = no)
+cp|chest pain (1: typical angina, 2: atypical angina, 3: non-anginal pain, 4: asymptomatic) | oldpeak | ST depression induc. ex.
+trestbps | resting blood pressure|slope|slope of peak exercise ST (**1**: upsloping, **2**: flat,**3**: downsloping)
+chol | serum cholesterol| ca | number of major vessels (0-3) colored by flourosopy
+fbs  |fasting blood sugar larger 120mg/dl (1 true)|thal | 3 normal; 6 fixed defect; 7 reversable defect
+restecg | resting electroc. result (0-normal,1-abnormal, 2-left ventricular hypertrophy)|num | diagnosis of heart disease (angiographic disease status) 0: < 50% diameter narrowing, 1: > 50% diameter narrowing 
+
+
+Loading required packages 
+
+```{r, message=FALSE}
+library(data.table)
+library(kableExtra)
+library(ggplot2)
+library(dplyr)
+library(tidybayes)
+library(GGally)  
+library(INLA)     #This is not on CRAN yet. You will need to install from the software site
+library(patchwork)
+library(MASS)
+```
+
+The below chunk reads data
+```{r}
+heart_data <-fread("https://archive.ics.uci.edu/ml/machine-learning-databases/heart-disease/processed.cleveland.data")
+names(heart_data) <- c('age','sex', 'cp','trestbps','chol','fbs','restecg','thalach',
+                      'exang','oldpeak', 'slope', 'ca','thal', 'num')
+```
+
+# Data processing
+
+Common problems associetd with data often include missing values, and weired charactors or strings. The first approach I undertake is to check the data for missing values and special charactors in the string variables.
+
+The second important task, undertaken in theis analysis is data orocessing interms of making the variables suitable for the regression model I am planning (ofcourse based on the nature of the data). Specifically I ought to use binary logistic regression and that requires te dependent variables to be dichotomised into a binary variable.
+
+Inspection of the dataset shows 2 variables are charactors(results not printed here-for space sake). These charactors can contain special charactors, and we need to investigate that
+```{r,  eval=FALSE}
+str(heart_data)
+```
+The dataset has 303 observations and 14 variables
+```{r}
+dim(heart_data)
+```
+Since the data has charactor variables, it can contain special charactors which is not going to be useful in the analysis. Running the following chunk, we can see that there are special charactors in the dataset. 
+
+```{r}
+table(grepl('[^[:punct:]]', heart_data$ca)) 
+table(grepl('[^[:punct:]]', heart_data$thal)) # check for special charactors in the dat
+```
+In total, the dataset has 6 special charactors (4 in the **ca** and  2 in **thal**). As these variables are numeric strings, converting into numeric variable will be the straightforward way to deal the data.
+
+```{r, warning=FALSE}
+heart_data <-heart_data %>% mutate_if(is.character,as.numeric)
+```
+
+## Inspect missing data
+```{r, warning=FALSE}
+heart_data %>%
+  dplyr::summarise_each(list(~sum(is.na(.))))
+```
+All the varibles in the dataset have no missing values except the two variables which we now converted into numeric  variables. As these variables are not continouse variables, I will simply exclude the observations with those missing values. 
+
+```{r}
+heart_data <-na.omit(heart_data)
+dim(heart_data)
+```
+Now let's take a look at the first 5 observations
+```{r}
+heart_data[1:5,] %>%
+  kbl(caption = "Table 1- The first 5 observations in the Cleveland Heart diseases data set") %>%
+  kable_classic(full_width = F, html_font = "tango") 
+
+```
+
+## Process the outcome variable and predictors
+As I am going to use binary logistic regression, I am here dichotomising the outcome variable
+
+```{r}
+#heart_data[, heartdisease:=0]
+heart_data[num!=0, num:=1] # dichotomising num into o and 1
+heart_data$restecg <- as.factor(heart_data$restecg)  
+heart_data$slope <- as.factor(heart_data$slope)  
+
+```
+
+## Exploratory data analysis
+The following figure indicates the distribution of heart disease by age and sex. Males in their 50's have higher burden
+
+```{r}
+
+heart_problem_absent <-heart_data[num==0, .(count = .N), by = age]
+heart_problem_present <-heart_data[num==1, .(count = .N), by = age]
+heart_problem_absent[, num:=0]; heart_problem_present[, num:=1]
+
+heart_problem<-rbind(heart_problem_absent, heart_problem_present)
+heart_problem$num <- as.factor(heart_problem$num);heart_problem$age <- as.factor(heart_problem$age)
+```
+
+
+```{r}
+ggplot(data=heart_problem, aes(x=age, y=count, fill=num)) +
+  geom_bar(stat="identity", position=position_dodge())+
+  scale_fill_brewer(palette="Paired")+
+  theme_classic() + theme(legend.position="bottom")
+```
+
+
+## Distribution, outliers   and correlation among continous variables
+
+Confounding occurs when a variable associated with a dependent variable is also associated to another predictor variable
+Let us check if  predictors variables (on the continous scale) are themselves correlated
+
+
+The following plots indicate that resting blood pressure, cholesterol level and thalach have outliers. Analysis by disease status alo showed outlieres
+
+**1. Outliers**
+
+```{r}
+ heart_data$num <- ifelse(heart_data$num==0, 0, 1)
+ heart_data_expl <-heart_data[, .(age, trestbps,chol,thalach)]
+ heart_data_expl[, id:=(1:nrow(heart_data_expl))]
+ heartdataexpL= melt(heart_data_expl, id.vars =c('id'))
+ a <- ggplot(heartdataexpL, aes(x=variable, y=value, color=variable)) +
+  geom_boxplot() + ggtitle('data with outliers ' ) + theme(legend.position = "none")
+ 
+```
+
+Although there are many ways to deal with out liers, here I have excluded them from analysis
+
+```{r}
+out_chol     <- boxplot.stats(heart_data$chol)$out
+out_tresbps <- boxplot.stats(heart_data$trestbps)$out
+out_thalach <- boxplot.stats(heart_data$thalach)$out
+
+out_chol_ind <- which(heart_data$chol %in% out_chol)
+out_tresbps_ind <- which(heart_data$trestbps %in% out_tresbps)
+out_thalach_ind <- which(heart_data$thalach %in% out_thalach)
+
+ heart_datanew <-heart_data[-c(out_chol_ind,out_tresbps_ind,out_thalach_ind),]
+```
+
+Now let us plot
+```{r}
+ heart_data_expl <-heart_datanew[, .(age, trestbps,chol,thalach)]
+ heart_data_expl[, id:=(1:nrow(heart_data_expl))]
+ heartdataexpL= melt(heart_data_expl, id.vars =c('id'))
+ b<-ggplot(heartdataexpL, aes(x=variable, y=value, color=variable)) +
+   geom_boxplot() + ggtitle('data without outliers ' ) + theme(legend.position = "none")
+ a+b
+```
+
+**2. Correlations and distributions by sex and disease status**
+
+The corner plot  below shows females are on average older than men, have higher average cholestrol levels and maximum heart rate achieved.  Resting blood pressure does not seem to vary between men and women. 
+Below we compare data by sex and disease status. The analysis shows that there is no considerable correlation between continous variables. So they are good to go 
+
+```{r}
+corr_sex <-heart_datanew[, .(age, trestbps,chol,thalach, sex)]
+
+corr_sex$sex = ifelse(corr_sex$sex==0, 'F', 'M')
+ggpairs(data=corr_sex, title="Correlation, distribution and outliers in heart data (continious variables)",
+              mapping=ggplot2::aes(colour = sex))
+
+```
+
+The following plot compared the distribution of variables by heart disease. Individuals with the problem tend to be in their 50's, have lower maximum heart rate achieved, have higher cholesterol levels (probably because of out lairs). 
+```{r}
+corr_num <-heart_datanew[, .(age, trestbps,chol,thalach, num)]
+
+corr_num$num = ifelse(corr_num$num==0, 'No', 'Yes')
+ggpairs(corr_num, title="Correlation, distribution and outliers in heart data (continious variables)",
+              mapping=ggplot2::aes(colour = num))
+
+```
+
+
+## Checking for confounders
+
+Cheeking interaction between age and sex and heart disease?
+
+The bar chart below captures the interaction between age, sex, and heart diseases. For females the disease pattern is not highly age dependent, although there is some clustering in those who are in their 50's, the frequency is not that high. However, among males, the disease spans throughout men's studied age, although it peaks in their 50's. This probably indicates, presence of age and male sex interaction mediated by some third factor that needs further exploration.
+
+
+
+```{r}
+heart_problem_absent <-heart_data[num==0, .(count = .N), by = .(age, sex)]
+heart_problem_present <-heart_data[num==1, .(count = .N), by = .(age, sex)]
+heart_problem_absent[, num:=0]; heart_problem_present[, num:=1]
+
+heart_problem<-rbind(heart_problem_absent, heart_problem_present)
+heart_problem$num <- as.factor(heart_problem$num);heart_problem$age <- as.factor(heart_problem$age)
+heart_problem$sex <-ifelse (heart_problem$sex=='0', "F", 'M')
+
+ggplot(data=heart_problem, aes(x=age, y=count, fill=num)) +
+  geom_bar(stat="identity", position=position_dodge())+
+  scale_fill_brewer(palette="Paired")+ facet_wrap(~sex)+
+  theme_bw() + theme(legend.position="bottom")
+
+```
+
+## Check for sparse information in categorical variables
+
+Here I am checking if  categorical variables have sparse information that will cause over and under estimation, or even numerical problems. I typically chose a categorical variable with multiple levels. As can be seen in the code below, level 2 of restecg has sparse information. There fore two levels might need regrouping.
+
+```{r, warning=FALSE}
+heart_data <-heart_data[-c(out_chol_ind,out_tresbps_ind,out_thalach_ind),]  # using the updated data
+tbl= table(heart_data$restecg, heart_data$num) 
+chisq.test(tbl) 
+  
+heart_data$restecg <-ifelse(heart_data$restecg=='0','0',' 1')   #regrouping again
+table(heart_data$restecg, heart_data$num) 
+
+```
+# Bayesian analysis
+
+developing different models
+
+```{r}
+
+#heart_data <- data.table(heart_data)
+heart_data[, id:=1:nrow(heart_data)]
+#====================================
+#=====Creating different models======================
+formula1 <- num~1
+formula2 = num~age+sex+chol+thalach + trestbps+fbs+restecg+
+         exang+oldpeak+slope+ca
+formula3 = num~age+sex+chol+thalach + trestbps+fbs+restecg+   # full model with random effects
+         exang+oldpeak+slope+ca+ f(id, model="iid")
+formula4= num~sex+chol+thalach + trestbps+fbs+                # full model minus age and restingecg excluded
+         exang+oldpeak+slope+ca
+formula5= num~sex+chol+thalach + fbs+
+         exang+oldpeak+slope+ca                               # age and restingecg and resting bp excluded
+```
+
+ Writing compact function to generate posterior estimates
+
+```{r}
+generate_bayesian_estimates <-  function(formula) {
+           model= inla(formula,
+                       data=heart_data,
+                       family = "binomial", Ntrials = 1,
+                       control.compute = list(dic= TRUE, cpo=TRUE),
+                       num.threads = 2)
+          return(summary(model))
+           
+         }
+        
+```
+
+Call a function to run bayesian analysis
+
+```{r}
+ model1 <-generate_bayesian_estimates(formula1)
+ model2 <-generate_bayesian_estimates(formula2)
+ model3 <-generate_bayesian_estimates(formula3)
+ model4 <-generate_bayesian_estimates(formula4)
+ model5 <-generate_bayesian_estimates(formula5)
+
+```
+
+Return the outputs by un commenting the following chunks
+```{r}
+ # model1
+ # model2
+ # model3
+ # model4
+ # model5
+```
+
+# Conclusion and the way forward
+
+The analysis presented here used Integrated nested Laplace Approximation to to generate parameter estimates. We have identified key factors that might be useful in early identification and even prevention of the problem. However the prior distribution considered is non-informative across all the parameters and would require testing the model using different prior specifications to test if the model correctly identifies the estimates.
+
+Some observations were excluded from analysis due to outliers and special characters. We didn't try using other data imputation methods and the impact of these exclusions needs to be checked although only few observations were trimmed in this case. 
+
+
+
